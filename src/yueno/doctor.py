@@ -1,4 +1,4 @@
-"""Environment checks for building audio.cpp and running YuE2 generation."""
+"""Environment checks for building audio.cpp and running generation."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from pathlib import Path
 
 from . import audiocpp, models
 from .config import Paths
+from .families import FAMILIES
 from .vram import query_gpu
 
 VSWHERE = Path(r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe")
@@ -42,7 +43,7 @@ def _visual_studio() -> str | None:
     return out or None
 
 
-def run_checks(paths: Paths, quant: str = models.DEFAULT_QUANT, vae: str = models.DEFAULT_VAE) -> list[Check]:
+def run_checks(paths: Paths) -> list[Check]:
     checks: list[Check] = []
 
     gpu = query_gpu()
@@ -63,13 +64,25 @@ def run_checks(paths: Paths, quant: str = models.DEFAULT_QUANT, vae: str = model
     checks.append(Check("ffmpeg", ff is not None, ff or "not on PATH (only needed for --format flac/mp3)",
                         required=False))
 
+    loaders: set[str] = set()
     if paths.exe.is_file():
-        ok = audiocpp.supports_yue2(paths.exe)
-        checks.append(Check("audiocpp_cli", ok, str(paths.exe) + ("" if ok else " (no yue2 loader; rebuild)")))
+        loaders = audiocpp.gen_families(paths.exe)
+        ok = bool(loaders)
+        detail = f"{paths.exe}; gen loaders: {', '.join(sorted(loaders))}" if ok else f"{paths.exe} (no gen loaders; rebuild)"
+        checks.append(Check("audiocpp_cli", ok, detail))
     else:
         checks.append(Check("audiocpp_cli", False, f"{paths.exe} missing; run 'yueno build'"))
 
-    missing = models.missing_files(paths.models, quant, vae)
-    detail = str(paths.models) if not missing else f"missing {len(missing)} file(s); run 'yueno models pull'"
-    checks.append(Check(f"models ({quant}, vae {vae})", not missing, detail))
+    any_ready = False
+    for fam in FAMILIES.values():
+        spec = models.spec_for(paths, fam)
+        directory = models.model_dir(paths, spec)
+        missing = models.missing_files(directory, models.required_files(fam, spec, fam.default_variant))
+        ready = not missing
+        any_ready = any_ready or ready
+        loader_note = "" if not loaders or fam.name in loaders else " (loader missing from binary)"
+        detail = f"{directory}{loader_note}" if ready else f"missing {len(missing)} file(s); run 'yueno models pull --model {fam.name}'"
+        checks.append(Check(f"models {fam.name} ({fam.default_variant})", ready, detail, required=False))
+    checks.append(Check("any model ready", any_ready, "at least one family's default weights are present" if any_ready
+                        else "no weights yet; run 'yueno models pull'"))
     return checks

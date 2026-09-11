@@ -1,9 +1,16 @@
 # yueno
 
-Command-line music generation with [YuE2](https://github.com/multimodal-art-projection/YuE) on a consumer NVIDIA
-GPU. The official Python pipeline needs 24 GB of VRAM. yueno instead drives
-[audio.cpp](https://github.com/0xShug0/audio.cpp) with Q8/Q4 GGUF weights, which peak at roughly 8.9 GB (Q8_0) or
-7.8 GB (Q4_0), so it fits an RTX 3080 10 GB. Generation runs on the GPU via CUDA.
+Command-line music generation on a consumer NVIDIA GPU. yueno drives
+[audio.cpp](https://github.com/0xShug0/audio.cpp) with GGUF weights, so models whose official pipelines need
+24 GB of VRAM fit an RTX 3080 10 GB. Supported model families:
+
+| `--model` | Model | Default weights | Inputs |
+|---|---|---|---|
+| `yue2` (default) | [YuE2 3B](https://github.com/multimodal-art-projection/YuE) | Q8_0 main + F16 VAE, 4.3 GB | style, lyrics, optional ABC score |
+| `minimax_music3` | [MiniMax Music 3](https://huggingface.co/audio-cpp/MiniMax-Music3-GGUF) | Q4_0 components, 7.9 GB | caption (style), lyrics, duration |
+
+Generation runs on the GPU via CUDA. Adding a family is one adapter class in `src/yueno/families.py`; weights,
+file lists, and option schemas come from audio.cpp's own `model_specs/<family>.json`.
 
 ## Prerequisites (Windows)
 
@@ -16,11 +23,12 @@ GPU. The official Python pipeline needs 24 GB of VRAM. yueno instead drives
 
 ```powershell
 uv sync
-uv run yueno doctor          # check GPU, toolchain, binary, models
-uv run yueno setup           # clone + build audio.cpp (pinned commit), download Q8_0 weights, doctor
+uv run yueno doctor          # check GPU, toolchain, binary, per-model weights
+uv run yueno setup           # clone + build audio.cpp (pinned commit), download YuE2 Q8_0 weights, doctor
+uv run yueno models pull --model minimax_music3     # optional second family (Q4_0 package)
 ```
 
-`setup` is `yueno build` followed by `yueno models pull`. Weights land in `models/Yue2-3B-GGUF/`, the binary in
+`setup` is `yueno build` followed by `yueno models pull`. Weights land in `models/<package>/`, the binary in
 `third_party/audio.cpp/build/windows-cuda-release/bin/`. Both directories are gitignored.
 
 ## Generate
@@ -30,32 +38,47 @@ uv run yueno setup           # clone + build audio.cpp (pinned commit), download
 ```powershell
 uv run yueno generate --request requests/example.json
 uv run yueno generate --style "dark synthwave, male vocal, 110 BPM" --lyrics-file lyrics.txt --cot off --seed 7
-uv run yueno generate -r song.json --quant q4_0 --format flac --out outputs/take2.wav
+uv run yueno generate -r song.json --package q4_0 --format flac --out outputs/take2.wav
+uv run yueno generate -r song.json -m minimax_music3 --duration 90      # same song, another model
+uv run yueno generate -r requests/compare.json                          # "model": [...] renders every family
 ```
+
+With several models the request runs each family in turn on the same style, lyrics, and seed, and names the
+outputs `<id>-<model>-<seed>.wav`. Keys a family does not understand are skipped with a note, so one request file
+serves every model.
 
 Key options:
 
 | Option | Meaning |
 |---|---|
-| `--cot full\|melody\|off` | Symbolic planning: melody+chords, melody only, or none (default `full`). |
-| `--abc-file score.abc` | Condition on an ABC score (needs `full` or `melody`). |
-| `--quant q8_0\|q4_0\|bf16`, `--vae f16\|f32` | Weight variants; `q8_0`+`f16` is the default. |
-| `--max-semantic-tokens N` | Caps song length (default 9000). Use a small value for quick smoke tests. |
-| `--steps N` | NAR ODE steps (default 32). |
-| `--cfg-scale F` | Classifier-free guidance on the semantic stage, 0..20. Default 1.0 with planning, 1.01 with `--cot off`. 1.0 means no guidance; higher values push harder toward the style and lyrics at the cost of variety. |
+| `--model NAME`, `-m` | Family to run; repeat for several. Overrides `model` in the request file. |
+| `--package q8_0\|q4_0\|bf16` | Weight variant of the family (`--quant` is the yue2 alias; `--vae f16\|f32` picks the yue2 VAE). |
+| `--steps N`, `--guidance F` | Shared knobs mapped per family: yue2 `num_inference_steps` (32) and `cfg_scale`; minimax `num_inference_steps` (30) and `guidance_scale` (1.7). `--cfg-scale` is an alias. |
+| `--duration S` | Length target for families that take one (minimax `duration_sec`, an AR budget, default 20). Skipped for yue2. |
+| `--cot full\|melody\|off` | yue2 symbolic planning: melody+chords, melody only, or none (default `full`). |
+| `--abc-file score.abc` | yue2: condition on an ABC score (needs `full` or `melody`). |
+| `--max-semantic-tokens N` | yue2: caps song length at 25 tokens per second (default 9000). |
+| `--opt key=value` | Any request option a family's spec lists, e.g. `--opt ar_guidance_scale=1.2`. Repeatable. |
 | `--seed N` | Reproducibility. Without a seed in the request file or on the command line, a random one is drawn, printed, and saved in the sidecar JSON. |
 | `--dry-run` | Print the `audiocpp_cli` command without running it. |
 | `-v` / `--verbose` | Show audio.cpp `[TIMING]`/`[TRACE]` lines. |
 
-Each run writes `<out>.request.json` next to the audio with the effective request, command, elapsed time, peak VRAM,
-and metric lines.
+Each run writes `<out>.request.json` next to the audio with the effective request, model, package, command, elapsed
+time, peak VRAM, and metric lines.
 
 ### Measured on an RTX 3080 10 GB (CUDA 13.4, driver 616.92)
 
 | Run | Audio | Wall time | RTF | Peak GPU memory (whole card) |
 |---|---|---|---|---|
-| `--cot off --max-semantic-tokens 1500`, q8_0 | 60 s | 20 s | 0.33 | 6.4 GB |
-| `--cot full`, default tokens, q8_0 | 147 s | 66 s | 0.45 | 8.1 GB |
+| yue2 `--cot off --max-semantic-tokens 1500`, q8_0 | 60 s | 20 s | 0.33 | 6.4 GB |
+| yue2 `--cot full`, default tokens, q8_0 | 147 s | 66 s | 0.45 | 8.1 GB |
+| minimax_music3 `--duration 20`, q4_0 | 20 s | 42 s | 2.1 | 9.8 GB |
+| minimax_music3 `--duration 60`, q4_0 | 48 s | 146 s | 3.0 | 9.9 GB |
+
+MiniMax Music 3 is a much larger model (its Q4_0 language model alone is 6 GB). On a 10 GB card it runs only
+because audio.cpp's `mem_saver` loads one stage at a time, which is why it is 3x slower than real time and sits
+within 0.4 GB of the VRAM limit. Keep `--duration` at 60 or below and close other GPU programs; a budget that
+does not fit fails with a CUDA out-of-memory error rather than degrading.
 
 Semantic tokens map to audio at 25 tokens per second, so the default cap of 9000 allows up to six minutes.
 
@@ -89,15 +112,20 @@ properly, make the model plan a shorter song instead:
 ```json
 {
   "id": "my_song",
+  "model": ["yue2", "minimax_music3"],
   "style": "genre, instruments, vocal character, language, tempo",
   "lyrics": "[Verse]\n...\n\n[Chorus]\n...",
+  "seed": 831001,
   "cot": "full",
-  "seed": 831001
+  "duration": 60
 }
 ```
 
-Optional fields: `seed`, `abc`, `abc_file`, `cfg_scale`, `steps`, `semantic_max_tokens`. Command-line flags override
-the file. Omit `seed` to get a different song on every run.
+`model` is a family name or a list (default `yue2`). Shared optional fields: `seed`, `steps`, `guidance`,
+`duration`. Anything else is passed to the family by its audio.cpp option name (`cot`, `abc_file`,
+`semantic_max_tokens`, `ar_guidance_scale`, ...); keys unknown to every family are rejected as typos. The old
+`cfg_scale` key still works as `guidance`. Command-line flags override the file. Omit `seed` to get a different
+song on every run.
 
 ## Development
 

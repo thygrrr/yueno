@@ -1,29 +1,13 @@
-"""GGUF weight variants and downloads from the audio-cpp/Yue2-3B-GGUF Hugging Face repo."""
+"""Weight packages: which files a family variant needs, what is present, and downloading from Hugging Face."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import HF_REPO
-
-QUANTS = {
-    "q8_0": "yue2-3b-q8_0.gguf",
-    "q4_0": "yue2-3b-q4_0.gguf",
-    "bf16": "yue2-3b-bf16.gguf",
-}
-VAES = {
-    "f16": "yue2-vae-f16.gguf",
-    "f32": "yue2-vae-f32.gguf",
-}
-SIDECARS = (
-    "sidecars/yue2-model-config.json",
-    "sidecars/yue2-generation-config.json",
-    "sidecars/yue2-qwen.tiktoken",
-    "sidecars/yue2-vae-config.json",
-)
-DEFAULT_QUANT = "q8_0"
-DEFAULT_VAE = "f16"
+from .config import Paths
+from .families import Family
+from .specs import ModelSpec, load_spec
 
 
 @dataclass(frozen=True)
@@ -36,38 +20,48 @@ class ModelFile:
         return self.size is not None
 
 
-def required_files(quant: str, vae: str) -> list[str]:
-    if quant not in QUANTS:
-        raise ValueError(f"unknown quant {quant!r}; choose from {', '.join(QUANTS)}")
-    if vae not in VAES:
-        raise ValueError(f"unknown vae {vae!r}; choose from {', '.join(VAES)}")
-    return [QUANTS[quant], VAES[vae], *SIDECARS]
+def spec_for(paths: Paths, family: Family) -> ModelSpec:
+    """The audio.cpp spec when the checkout has it, else the adapter's built-in fallback."""
+    spec = load_spec(paths, family.name) or family.fallback_spec
+    if spec is None:
+        raise ValueError(f"no model spec available for {family.name}")
+    return spec
 
 
-def missing_files(model_dir: Path, quant: str, vae: str) -> list[str]:
-    return [rel for rel in required_files(quant, vae) if not (model_dir / rel).is_file()]
+def model_dir(paths: Paths, spec: ModelSpec) -> Path:
+    return paths.models / spec.target_directory
 
 
-def inventory(model_dir: Path) -> list[ModelFile]:
-    files = []
-    for rel in [*QUANTS.values(), *VAES.values(), *SIDECARS]:
-        path = model_dir / rel
-        files.append(ModelFile(rel, path.stat().st_size if path.is_file() else None))
-    return files
+def required_files(family: Family, spec: ModelSpec, variant: str, settings: dict[str, str] | None = None) -> list[str]:
+    return family.component_files(spec, variant, settings or {})
 
 
-def pull(model_dir: Path, quant: str, vae: str, *, log=print) -> list[Path]:
-    """Download the selected weights and all sidecars into model_dir, skipping files already present."""
+def missing_files(directory: Path, files: list[str]) -> list[str]:
+    return [rel for rel in files if not (directory / rel).is_file()]
+
+
+def inventory(directory: Path, spec: ModelSpec) -> list[ModelFile]:
+    seen: list[str] = []
+    for pkg in spec.packages:
+        for rel in pkg.files:
+            if rel not in seen:
+                seen.append(rel)
+    return [ModelFile(rel, (directory / rel).stat().st_size if (directory / rel).is_file() else None) for rel in seen]
+
+
+def pull(directory: Path, spec: ModelSpec, files: list[str], *, log=print) -> list[Path]:
+    """Download files from the spec's Hugging Face repo into directory, skipping files already present."""
     from huggingface_hub import hf_hub_download
 
-    model_dir.mkdir(parents=True, exist_ok=True)
+    if not spec.repo:
+        raise ValueError(f"{spec.family} spec has no download repo")
+    directory.mkdir(parents=True, exist_ok=True)
     downloaded = []
-    for rel in required_files(quant, vae):
-        target = model_dir / rel
-        if target.is_file():
+    for rel in files:
+        if (directory / rel).is_file():
             log(f"present  {rel}")
             continue
         log(f"download {rel}")
-        got = hf_hub_download(repo_id=HF_REPO, filename=rel, local_dir=str(model_dir))
+        got = hf_hub_download(repo_id=spec.repo, filename=rel, revision=spec.revision, local_dir=str(directory))
         downloaded.append(Path(got))
     return downloaded

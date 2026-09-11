@@ -1,5 +1,6 @@
 import pytest
 
+from yueno.families import MINIMAX_MUSIC3, YUE2
 from yueno.vram import GpuInfo, looks_like_oom, parse_gpu_csv, vram_warning
 
 
@@ -14,14 +15,15 @@ def test_parse_gpu_csv_rejects_garbage():
 
 
 def test_vram_warning_thresholds():
-    assert vram_warning(8769, "q8_0") is None  # RTX 3080 with the desktop running
-    w = vram_warning(8000, "q8_0")
-    assert w is not None and "--quant q4_0" in w
-    w = vram_warning(6000, "q8_0")
-    assert w is not None and "--max-semantic-tokens" in w
-    assert vram_warning(8769, "bf16") is not None
-    assert vram_warning(20000, "bf16") is None
-    assert vram_warning(8769, "unknown") is None
+    assert vram_warning(8769, YUE2, "q8_0") is None  # RTX 3080 with the desktop running
+    w = vram_warning(8000, YUE2, "q8_0")
+    assert w is not None and "--package q4_0" in w
+    w = vram_warning(6000, YUE2, "q8_0")
+    assert w is not None and "Shorten" in w
+    assert vram_warning(8769, YUE2, "bf16") is not None
+    assert vram_warning(20000, YUE2, "bf16") is None
+    assert vram_warning(1000, MINIMAX_MUSIC3, "q8_0") is None  # never measured: stay silent
+    assert vram_warning(9000, MINIMAX_MUSIC3, "q4_0") is not None
 
 
 @pytest.mark.parametrize("text,expected", [

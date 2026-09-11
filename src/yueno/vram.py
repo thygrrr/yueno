@@ -1,4 +1,4 @@
-"""GPU memory queries via nvidia-smi and 10GB-card heuristics."""
+"""GPU memory queries via nvidia-smi and low-VRAM heuristics."""
 
 from __future__ import annotations
 
@@ -8,9 +8,8 @@ import subprocess
 import threading
 from dataclasses import dataclass
 
-# Process VRAM at peak, rounded up. q8_0 measured 7.2 GiB on an RTX 3080 for a 147 s song (8055 MiB total with
-# the desktop's ~900 MiB); q4_0/bf16 offsets follow audio.cpp's 5090 measurements (7755 / 12535 vs 8867 MiB).
-PEAK_MIB = {"q8_0": 7700, "q4_0": 6600, "bf16": 11400}
+from .families import Family
+
 HEADROOM_MIB = 512
 
 _OOM_PATTERNS = (
@@ -52,14 +51,14 @@ def query_gpu(index: int = 0) -> GpuInfo | None:
     return parse_gpu_csv(out.splitlines()[0]) if out else None
 
 
-def vram_warning(free_mib: int, quant: str) -> str | None:
-    """Return a warning when the chosen quantization is unlikely to fit in the free VRAM."""
-    need = PEAK_MIB.get(quant)
+def vram_warning(free_mib: int, family: Family, variant: str) -> str | None:
+    """Warn when the variant's measured peak is unlikely to fit; silent for variants never measured."""
+    need = family.peak_mib.get(variant)
     if need is None or free_mib >= need + HEADROOM_MIB:
         return None
-    fits = [q for q in ("q8_0", "q4_0") if free_mib >= PEAK_MIB[q] + HEADROOM_MIB]
-    hint = f" Consider --quant {fits[0]}." if fits else " Lower --max-semantic-tokens or free GPU memory."
-    return f"{quant} peaks near {need} MiB but only {free_mib} MiB VRAM is free.{hint}"
+    fits = [v for v in family.variants if v != variant and free_mib >= family.peak_mib.get(v, 10**9) + HEADROOM_MIB]
+    hint = f" Consider --package {fits[0]}." if fits else " Shorten the song or free GPU memory."
+    return f"{family.name} {variant} peaks near {need} MiB but only {free_mib} MiB VRAM is free.{hint}"
 
 
 def looks_like_oom(text: str) -> bool:

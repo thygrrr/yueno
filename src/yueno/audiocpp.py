@@ -108,11 +108,22 @@ def list_loaders(exe: Path) -> str:
     return proc.stdout + proc.stderr
 
 
-def supports_yue2(exe: Path) -> bool:
+def gen_families(exe: Path) -> set[str]:
+    """Family names the binary reports as generation loaders ('<name>: gen (...)' lines)."""
     try:
-        return "yue2" in list_loaders(exe).lower()
+        text = list_loaders(exe)
     except (OSError, subprocess.SubprocessError):
-        return False
+        return set()
+    names = set()
+    for line in text.splitlines():
+        name, sep, rest = line.partition(":")
+        if sep and rest.strip().startswith("gen"):
+            names.add(name.strip())
+    return names
+
+
+def supports_family(exe: Path, family: str) -> bool:
+    return family in gen_families(exe)
 
 
 def source_sha(paths: Paths) -> str | None:

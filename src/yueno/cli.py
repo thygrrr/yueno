@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -17,10 +18,12 @@ from rich.table import Table
 from . import __version__, audiocpp, models, postprocess
 from .config import AUDIOCPP_PINNED_SHA, Paths
 from .doctor import run_checks
-from .request import COT_MODES, RequestError, SongRequest, build_generate_args
+from .families import FAMILIES, YUE2, YUE2_COT_MODES, YUE2_VAES, Family, FamilyError, get_family
+from .request import RequestError, SongRequest, parse_models
+from .specs import ModelSpec, SpecError
 from .vram import PeakSampler, looks_like_oom, query_gpu, vram_warning
 
-app = typer.Typer(help="Generate music with YuE2 on a consumer GPU via audio.cpp GGUF inference.",
+app = typer.Typer(help="Generate music with YuE2, MiniMax Music 3, and other audio.cpp GGUF models on a consumer GPU.",
                   no_args_is_help=True, add_completion=False)
 models_app = typer.Typer(help="Download and inspect GGUF weights.", no_args_is_help=True)
 app.add_typer(models_app, name="models")
@@ -28,8 +31,8 @@ app.add_typer(models_app, name="models")
 out = Console()
 err = Console(stderr=True)
 
-QUANT_HELP = f"Model quantization: {', '.join(models.QUANTS)}"
-VAE_HELP = f"VAE precision: {', '.join(models.VAES)}"
+MODEL_HELP = f"Model family: {', '.join(FAMILIES)} (default from the request file, else yue2)"
+PACKAGE_HELP = "Weight variant for the family, e.g. q8_0, q4_0, bf16 (default per family)"
 
 
 def _version(value: bool) -> None:
@@ -65,11 +68,11 @@ def _fail(message: str, code: int = 1) -> None:
     raise typer.Exit(code)
 
 
-def _check_variant(quant: str, vae: str) -> None:
-    if quant not in models.QUANTS:
-        _fail(f"unknown --quant {quant!r}; choose from {', '.join(models.QUANTS)}", 2)
-    if vae not in models.VAES:
-        _fail(f"unknown --vae {vae!r}; choose from {', '.join(models.VAES)}", 2)
+def _family(name: str) -> Family:
+    try:
+        return get_family(name)
+    except FamilyError as exc:
+        _fail(str(exc), 2)
 
 
 def _print_checks(checks) -> bool:
@@ -92,12 +95,9 @@ def _print_checks(checks) -> bool:
 
 
 @app.command()
-def doctor(quant: str = typer.Option(models.DEFAULT_QUANT, help=QUANT_HELP),
-           vae: str = typer.Option(models.DEFAULT_VAE, help=VAE_HELP)) -> None:
-    """Report GPU, toolchain, audiocpp_cli, and model status."""
-    _check_variant(quant, vae)
-    healthy = _print_checks(run_checks(Paths.resolve(), quant, vae))
-    if not healthy:
+def doctor() -> None:
+    """Report GPU, toolchain, audiocpp_cli, and per-model weight status."""
+    if not _print_checks(run_checks(Paths.resolve())):
         raise typer.Exit(1)
 
 
@@ -112,55 +112,93 @@ def build(sha: str = typer.Option(AUDIOCPP_PINNED_SHA, help="audio.cpp commit to
         exe = audiocpp.build(paths, sha=sha, jobs=jobs, clean=clean, cuda_arch=cuda_arch, log=err.print)
     except audiocpp.BuildError as exc:
         _fail(str(exc))
-    if not audiocpp.supports_yue2(exe):
-        _fail(f"{exe} built, but --list-loaders does not report yue2; check the pinned commit")
-    out.print(f"[green]built[/green] {exe}")
+    loaders = audiocpp.gen_families(exe)
+    missing = sorted(set(FAMILIES) - loaders)
+    if missing:
+        _fail(f"{exe} built, but --list-loaders lacks {', '.join(missing)}; check the pinned commit")
+    out.print(f"[green]built[/green] {exe} (gen loaders: {', '.join(sorted(loaders))})")
+
+
+@dataclass(frozen=True)
+class _Weights:
+    family: Family
+    spec: ModelSpec
+    directory: Path
+    variant: str
+    settings: dict[str, str]
+    files: list[str]
+
+
+def _resolve_weights(paths: Paths, family: Family, variant: str | None, settings: dict[str, str]) -> _Weights:
+    try:
+        spec = models.spec_for(paths, family)
+        chosen = variant or family.default_variant
+        family.check_variant(chosen)
+        files = models.required_files(family, spec, chosen, settings)
+    except (SpecError, FamilyError, ValueError) as exc:
+        _fail(str(exc), 2)
+    return _Weights(family, spec, models.model_dir(paths, spec), chosen, settings, files)
 
 
 @models_app.command("pull")
-def models_pull(quant: str = typer.Option(models.DEFAULT_QUANT, help=QUANT_HELP),
-                vae: str = typer.Option(models.DEFAULT_VAE, help=VAE_HELP)) -> None:
-    """Download the selected GGUF weights and sidecar files from Hugging Face."""
-    _check_variant(quant, vae)
+def models_pull(model: str = typer.Option(YUE2.name, "--model", help=MODEL_HELP),
+                package: str | None = typer.Option(None, "--package", help=PACKAGE_HELP),
+                quant: str | None = typer.Option(None, help="Alias of --package for yue2"),
+                vae: str = typer.Option("f16", help=f"yue2 VAE precision: {', '.join(YUE2_VAES)}")) -> None:
+    """Download a family's weights (one variant plus its shared files) from Hugging Face."""
     paths = Paths.resolve()
-    got = models.pull(paths.models, quant, vae, log=err.print)
-    out.print(f"[green]ready[/green] {paths.models} ({len(got)} file(s) downloaded)")
+    w = _resolve_weights(paths, _family(model), package or quant, {"vae": vae})
+    try:
+        got = models.pull(w.directory, w.spec, w.files, log=err.print)
+    except ValueError as exc:
+        _fail(str(exc))
+    out.print(f"[green]ready[/green] {w.family.name} {w.variant} in {w.directory} ({len(got)} file(s) downloaded)")
 
 
 def _human_size(size: int) -> str:
-    return f"{size / 2**20:,.0f} MiB" if size >= 2**20 else f"{size / 2**10:,.0f} KiB"
+    if size >= 2**20:
+        return f"{size / 2**20:,.0f} MiB"
+    return f"{size / 2**10:,.0f} KiB" if size >= 2**10 else f"{size} B"
 
 
 @models_app.command("list")
-def models_list() -> None:
-    """Show which weight variants are present locally."""
+def models_list(model: str | None = typer.Option(None, "--model", help="Only this family")) -> None:
+    """Show which weight files are present locally, per family."""
     paths = Paths.resolve()
-    table = Table(title=str(paths.models))
-    table.add_column("file")
-    table.add_column("size", justify="right")
-    for f in models.inventory(paths.models):
-        size = _human_size(f.size) if f.present else "[dim]absent[/dim]"
-        table.add_row(f.relpath, size)
-    out.print(table)
+    names = [model] if model else list(FAMILIES)
+    for name in names:
+        fam = _family(name)
+        try:
+            spec = models.spec_for(paths, fam)
+        except (SpecError, ValueError) as exc:
+            _fail(str(exc))
+        directory = models.model_dir(paths, spec)
+        table = Table(title=f"{fam.display_name} ({fam.name}): {directory}")
+        table.add_column("file")
+        table.add_column("size", justify="right")
+        for f in models.inventory(directory, spec):
+            table.add_row(f.relpath, _human_size(f.size) if f.present else "[dim]absent[/dim]")
+        out.print(table)
 
 
 @app.command()
-def setup(quant: str = typer.Option(models.DEFAULT_QUANT, help=QUANT_HELP),
-          vae: str = typer.Option(models.DEFAULT_VAE, help=VAE_HELP),
+def setup(model: str = typer.Option(YUE2.name, "--model", help=MODEL_HELP),
+          package: str | None = typer.Option(None, "--package", help=PACKAGE_HELP),
           jobs: int = typer.Option(0, help="Parallel build jobs"),
           sha: str = typer.Option(AUDIOCPP_PINNED_SHA, help="audio.cpp commit to build")) -> None:
-    """First-time setup: build audiocpp_cli, download weights, then run doctor."""
-    _check_variant(quant, vae)
+    """First-time setup: build audiocpp_cli, download one family's weights, then run doctor."""
     paths = Paths.resolve()
-    if paths.exe.is_file() and audiocpp.supports_yue2(paths.exe):
+    fam = _family(model)
+    if paths.exe.is_file() and audiocpp.supports_family(paths.exe, fam.name):
         err.print(f"audiocpp_cli already built: {paths.exe}")
     else:
         try:
             audiocpp.build(paths, sha=sha, jobs=jobs, log=err.print)
         except audiocpp.BuildError as exc:
             _fail(str(exc))
-    models.pull(paths.models, quant, vae, log=err.print)
-    if not _print_checks(run_checks(paths, quant, vae)):
+    w = _resolve_weights(paths, fam, package, {"vae": "f16"})
+    models.pull(w.directory, w.spec, w.files, log=err.print)
+    if not _print_checks(run_checks(paths)):
         raise typer.Exit(1)
 
 
@@ -180,6 +218,16 @@ def _load_request(request: Path | None, style: str | None, lyrics: str | None, l
     return SongRequest(style=style, lyrics=lyrics)
 
 
+def _parse_opts(opts: list[str]) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for item in opts:
+        key, sep, value = item.partition("=")
+        if not sep or not key.strip():
+            raise RequestError(f"--opt expects key=value; got {item!r}")
+        parsed[key.strip()] = value
+    return parsed
+
+
 def _default_threads() -> int:
     cpus = os.cpu_count() or 8
     return max(4, min(16, cpus // 2))
@@ -187,81 +235,122 @@ def _default_threads() -> int:
 
 @app.command()
 def generate(
-    request: Path | None = typer.Option(None, "--request", "-r", help="JSON request file (style, lyrics, cot, seed, ...)"),
+    request: Path | None = typer.Option(None, "--request", "-r", help="JSON request file (style, lyrics, model, seed, ...)"),
+    model: list[str] = typer.Option(None, "--model", "-m", help=MODEL_HELP + "; repeat for several"),
     style: str | None = typer.Option(None, help="Style prompt: genre, instruments, vocal, language, tempo"),
     lyrics: str | None = typer.Option(None, help="Lyrics text with [Verse]/[Chorus] section tags"),
     lyrics_file: Path | None = typer.Option(None, help="Read lyrics from a UTF-8 text file"),
     song_id: str | None = typer.Option(None, "--id", help="Song id used for the default output name"),
-    cot: str | None = typer.Option(None, help=f"Planning mode: {', '.join(COT_MODES)} (default full)"),
     seed: int | None = typer.Option(None, help="Random seed (default: a fresh random seed, printed and recorded)"),
-    abc_file: Path | None = typer.Option(None, help="ABC score to condition on (needs cot full or melody)"),
-    cfg_scale: float | None = typer.Option(None, help="Classifier-free guidance, 0..20"),
-    steps: int | None = typer.Option(None, help="NAR ODE steps (default 32)"),
-    max_semantic_tokens: int | None = typer.Option(None, help="Cap on semantic tokens, i.e. song length (default 9000)"),
-    quant: str = typer.Option(models.DEFAULT_QUANT, help=QUANT_HELP),
-    vae: str = typer.Option(models.DEFAULT_VAE, help=VAE_HELP),
+    steps: int | None = typer.Option(None, help="Inference steps (yue2 NAR ODE steps 32, minimax flow steps 30)"),
+    guidance: float | None = typer.Option(None, help="Guidance scale (yue2 cfg_scale, minimax guidance_scale)"),
+    cfg_scale: float | None = typer.Option(None, help="Alias of --guidance"),
+    duration: float | None = typer.Option(None, help="Target length in seconds for families that take one (minimax)"),
+    cot: str | None = typer.Option(None, help=f"yue2 planning mode: {', '.join(YUE2_COT_MODES)} (default full)"),
+    abc_file: Path | None = typer.Option(None, help="yue2 ABC score to condition on (needs cot full or melody)"),
+    max_semantic_tokens: int | None = typer.Option(None, help="yue2 cap on semantic tokens, 25 per second (default 9000)"),
+    opt: list[str] = typer.Option(None, "--opt", help="Any spec-listed request option as key=value; repeatable"),
+    package: str | None = typer.Option(None, "--package", help=PACKAGE_HELP),
+    quant: str | None = typer.Option(None, help="Alias of --package for yue2"),
+    vae: str = typer.Option("f16", help=f"yue2 VAE precision: {', '.join(YUE2_VAES)}"),
     threads: int = typer.Option(_default_threads(), help="CPU threads for audiocpp_cli"),
-    output: Path | None = typer.Option(None, "--out", "-o", help="Output WAV path (default outputs/<id>-<seed>.wav)"),
+    output: Path | None = typer.Option(None, "--out", "-o", help="Output WAV path (single model only; default outputs/<id>-<seed>.wav)"),
     fmt: str = typer.Option("wav", "--format", help=f"Final format: {', '.join(postprocess.FORMATS)} (ffmpeg)"),
     device: int | None = typer.Option(None, help="CUDA device index"),
-    overwrite: bool = typer.Option(False, help="Replace an existing output file"),
-    dry_run: bool = typer.Option(False, help="Print the audiocpp_cli command and exit"),
+    overwrite: bool = typer.Option(False, help="Replace existing output files"),
+    dry_run: bool = typer.Option(False, help="Print the audiocpp_cli command(s) and exit"),
     json_output: bool = typer.Option(False, "--json", help="Ask audiocpp_cli for machine-readable output"),
     skip_vram_check: bool = typer.Option(False, help="Do not warn about free VRAM"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show audiocpp_cli [TIMING]/[TRACE] lines"),
 ) -> None:
-    """Generate a song from a style prompt and lyrics."""
-    _check_variant(quant, vae)
+    """Generate a song from a style prompt and lyrics with one or more model families."""
     if fmt not in postprocess.FORMATS:
         _fail(f"unknown --format {fmt!r}; choose from {', '.join(postprocess.FORMATS)}", 2)
+    if guidance is not None and cfg_scale is not None:
+        _fail("give either --guidance or --cfg-scale", 2)
+    paths = Paths.resolve()
     try:
         req = _load_request(request, style, lyrics, lyrics_file)
-        req = req.with_overrides(id=song_id, cot=cot, seed=seed, cfg_scale=cfg_scale, steps=steps,
-                                 semantic_max_tokens=max_semantic_tokens,
-                                 abc_file=str(abc_file.resolve()) if abc_file else None)
-        req.validate()
+        req = req.with_overrides(id=song_id, seed=seed, steps=steps, duration=duration,
+                                 guidance=guidance if guidance is not None else cfg_scale,
+                                 models=parse_models(list(model)) if model else None)
+        req = req.with_extra(cot=cot, abc_file=str(abc_file.resolve()) if abc_file else None,
+                             semantic_max_tokens=max_semantic_tokens, **_parse_opts(list(opt or [])))
+        families = [get_family(name) for name in req.models]
+        specs = {f.name: models.spec_for(paths, f) for f in families}
+        for note in req.validate(families, specs):
+            err.print(f"[dim]note:[/dim] {note}")
         req = req.resolve_seed()
-    except RequestError as exc:
+    except (RequestError, FamilyError, SpecError, ValueError) as exc:
         _fail(str(exc), 2)
 
-    paths = Paths.resolve()
-    wav = (output or paths.outputs / f"{req.id}-{req.seed}.wav").resolve()
-    if wav.suffix.lower() != ".wav":
-        _fail("--out must end in .wav; use --format to convert afterwards", 2)
-    cmd = build_generate_args(req, exe=paths.exe, model_dir=paths.models, model_gguf=models.QUANTS[quant],
-                              vae_gguf=models.VAES[vae], threads=threads, out=wav, json_output=json_output, device=device)
+    multi = len(families) > 1
+    if output is not None and multi:
+        _fail("--out applies to a single model; with several models outputs are named <id>-<model>-<seed>.wav", 2)
+    settings = {"vae": vae}
+    variant_for = {f.name: (package or (quant if f is YUE2 else None)) for f in families}
+    plan: list[tuple[_Weights, Path, list[str]]] = []
+    for fam in families:
+        w = _resolve_weights(paths, fam, variant_for[fam.name], settings)
+        stem = f"{req.id}-{fam.name}-{req.seed}" if multi else f"{req.id}-{req.seed}"
+        wav = (output or paths.outputs / f"{stem}.wav").resolve()
+        if wav.suffix.lower() != ".wav":
+            _fail("--out must end in .wav; use --format to convert afterwards", 2)
+        try:
+            cmd = fam.build_args(req, exe=paths.exe, model_dir=w.directory, spec=w.spec, variant=w.variant,
+                                 settings=settings, threads=threads, out=wav, json_output=json_output, device=device)
+        except (FamilyError, RequestError, SpecError) as exc:
+            _fail(str(exc), 2)
+        plan.append((w, wav, cmd))
+
     if dry_run:
-        out.print(subprocess.list2cmdline(cmd))
+        for _, _, cmd in plan:
+            typer.echo(subprocess.list2cmdline(cmd))  # plain echo: no line wrapping of long commands
         raise typer.Exit()
 
     if not paths.exe.is_file():
         _fail(f"{paths.exe} not found; run 'yueno build' (or 'yueno setup')")
-    missing = models.missing_files(paths.models, quant, vae)
-    if missing:
-        _fail(f"missing model files: {', '.join(missing)}; run 'yueno models pull --quant {quant} --vae {vae}'")
-    if wav.exists() and not overwrite:
-        _fail(f"{wav} exists; pass --overwrite or choose --out")
-    wav.parent.mkdir(parents=True, exist_ok=True)
+    for w, wav, _ in plan:
+        missing = models.missing_files(w.directory, w.files)
+        if missing:
+            _fail(f"{w.family.name}: missing model files: {', '.join(missing)}; run "
+                  f"'yueno models pull --model {w.family.name} --package {w.variant}'")
+        if wav.exists() and not overwrite:
+            _fail(f"{wav} exists; pass --overwrite or choose --out")
+    paths.outputs.mkdir(parents=True, exist_ok=True)
 
+    failures = 0
+    for w, wav, cmd in plan:
+        if not _run_one(paths, req, w, wav, cmd, fmt=fmt, device=device, skip_vram_check=skip_vram_check,
+                        verbose=verbose):
+            failures += 1
+    if failures:
+        _fail(f"{failures} of {len(plan)} model run(s) failed", 1)
+
+
+def _run_one(paths: Paths, req: SongRequest, w: _Weights, wav: Path, cmd: list[str], *, fmt: str,
+             device: int | None, skip_vram_check: bool, verbose: bool) -> bool:
+    fam = w.family
     gpu = query_gpu(device or 0)
     if gpu and not skip_vram_check:
-        warning = vram_warning(gpu.free_mib, quant)
+        warning = vram_warning(gpu.free_mib, fam, w.variant)
         if warning:
             err.print(f"[yellow]warning:[/yellow] {warning}")
 
-    err.print(f"[bold]yueno[/bold] {req.id} seed={req.seed} cot={req.cot} quant={quant} vae={vae} -> {wav}")
+    err.print(f"[bold]yueno[/bold] {req.id} model={fam.name} package={w.variant} seed={req.seed} -> {wav}")
     started = time.monotonic()
     with PeakSampler(index=device or 0) as sampler:
         code, log_text = audiocpp.run_streaming(cmd, cwd=paths.exe.parent, on_line=_line_printer(verbose))
     elapsed = time.monotonic() - started
 
     metrics = _parse_metrics(log_text)
-    truncated = _was_truncated(log_text)
+    truncated = _was_truncated(log_text, fam.truncation_marker)
     record = {
         "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "request": req.to_dict(),
-        "quant": quant,
-        "vae": vae,
+        "model": fam.name,
+        "package": w.variant,
+        "settings": w.settings,
         "audiocpp_sha": audiocpp.source_sha(paths),
         "command": cmd,
         "exit_code": code,
@@ -274,26 +363,32 @@ def generate(
 
     if code != 0:
         if looks_like_oom(log_text):
-            err.print("[red]CUDA ran out of memory.[/red] Retry with --quant q4_0 or a lower "
-                      "--max-semantic-tokens, and close other GPU programs.")
-        _fail(f"audiocpp_cli exited with code {code}", code)
+            lighter = [v for v in fam.variants if fam.peak_mib.get(v, 0) < fam.peak_mib.get(w.variant, 0)]
+            hint = f"--package {lighter[0]}" if lighter else "a lighter --package"
+            err.print(f"[red]CUDA ran out of memory.[/red] Retry with {hint} or a shorter song, "
+                      "and close other GPU programs.")
+        err.print(f"[red]error:[/red] {fam.name}: audiocpp_cli exited with code {code}")
+        return False
     if not wav.is_file():
-        _fail(f"audiocpp_cli exited 0 but {wav} was not written")
+        err.print(f"[red]error:[/red] {fam.name}: audiocpp_cli exited 0 but {wav} was not written")
+        return False
 
     if truncated:
-        err.print("[yellow]warning:[/yellow] the song hit --max-semantic-tokens and was cut off before its natural "
+        err.print("[yellow]warning:[/yellow] the song hit its token cap and was cut off before its natural "
                   "ending; raise the cap or shorten the lyrics.")
     final = wav
     if fmt != "wav":
         try:
             final = postprocess.convert(wav, fmt)
         except (RuntimeError, subprocess.CalledProcessError) as exc:
-            _fail(f"conversion failed: {exc}")
+            err.print(f"[red]error:[/red] conversion failed: {exc}")
+            return False
     peak = f", peak VRAM {sampler.peak_mib} MiB" if sampler.peak_mib else ""
     audio_s = metrics.get("audio_duration_ms")
     length = f", {float(audio_s) / 1000:.0f}s audio" if audio_s else ""
     rtf = f", RTF {float(metrics['rtf']):.2f}" if "rtf" in metrics else ""
-    out.print(f"[green]done[/green] {final} ({elapsed:.0f}s{length}{rtf}{peak})")
+    out.print(f"[green]done[/green] {fam.name}: {final} ({elapsed:.0f}s{length}{rtf}{peak})")
+    return True
 
 
 def _line_printer(verbose: bool):
@@ -304,9 +399,11 @@ def _line_printer(verbose: bool):
     return on_line
 
 
-def _was_truncated(log_text: str) -> bool:
-    """audio.cpp logs 'yue2.semantic.truncated 1' when generation stopped at the token cap."""
-    return any(line.rstrip().endswith("yue2.semantic.truncated 1") for line in log_text.splitlines())
+def _was_truncated(log_text: str, marker: str | None) -> bool:
+    """True when the family's 'hit the token cap' log line appears (e.g. 'yue2.semantic.truncated 1')."""
+    if not marker:
+        return False
+    return any(line.rstrip().endswith(marker) for line in log_text.splitlines())
 
 
 def _parse_metrics(log_text: str) -> dict[str, str]:

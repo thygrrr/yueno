@@ -1,0 +1,9 @@
+{
+  "id": "compare",
+  "model": ["yue2", "minimax_music3"],
+  "style": "upbeat synth pop, bright female vocal, punchy drums, arpeggiated synths, 118 BPM, hopeful",
+  "lyrics": "[Verse]\nWe left the keys on the kitchen table\nDrove until the signs ran out\nEvery station played the same old fable\nAnd we sang it anyway, loud\n\n[Chorus]\nRun, run, into the morning\nNothing behind us worth a look\nRun, run, no need for warning\nWe wrote the ending in our own book\n\n[Outro]\nIn our own book\n",
+  "seed": 31337,
+  "cot": "full",
+  "duration": 60
+}
