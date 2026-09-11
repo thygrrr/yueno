@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+dist/
+build/
+third_party/
+models/
+outputs/
+
+# generated audio anywhere
+*.wav
+*.flac
+*.mp3

@@ -1,0 +1,29 @@
+[project]
+name = "yueno"
+version = "0.1.0"
+description = "Command-line YuE2 music generation on consumer GPUs via audio.cpp GGUF weights"
+readme = "README.md"
+authors = [
+    { name = "tiger tiger tiger", email = "tiger@tiger.blue" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "typer>=0.15",
+    "rich>=13",
+    "huggingface_hub>=0.30",
+]
+
+[project.scripts]
+yueno = "yueno.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.18,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
