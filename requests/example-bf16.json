@@ -1,0 +1,10 @@
+{
+  "id": "first_light_bf16",
+  "model": "yue2",
+  "package": "bf16",
+  "style": "English acoustic indie pop, warm female vocal, fingerpicked guitar, gentle piano, soft brushed drums, 90 BPM, intimate and hopeful",
+  "lyrics": "[Verse]\nThe streetlights fade, the kettle sings\nWe leave the night to other things\n\n[Chorus]\nHere comes the first light, soft and slow\nA little more sky than we used to know\n\n[Outro]\nA little more sky\n",
+  "cot": "full",
+  "semantic_max_tokens": 1500,
+  "seed": 831001
+}

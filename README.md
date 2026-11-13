@@ -14,7 +14,7 @@ file lists, and option schemas come from audio.cpp's own `model_specs/<family>.j
 
 ## Prerequisites (Windows)
 
-- NVIDIA driver 580 or newer and an Ampere or newer GPU (compute capability 7.5+).
+- NVIDIA driver 580 or newer and a Turing or newer GPU (compute capability 7.5+, including RTX 20-series).
 - CUDA Toolkit 13.x (13.4.1 tested target). Visual Studio 2026 requires CUDA 13.2 or newer.
 - Visual Studio 2022/2026 with the C++ desktop workload, CMake, Ninja, git.
 - [uv](https://docs.astral.sh/uv/). Optional: ffmpeg for `--format flac|mp3`.
@@ -30,6 +30,12 @@ uv run yueno models pull --model minimax_music3     # optional second family (Q4
 
 `setup` is `yueno build` followed by `yueno models pull`. Weights land in `models/<package>/`, the binary in
 `third_party/audio.cpp/build/windows-cuda-release/bin/`. Both directories are gitignored.
+
+Builds detect the first NVIDIA GPU's compute capability by default. If you copied an existing build from
+another machine, rebuild it for this GPU with `uv run yueno build`. You can select the target explicitly with
+`--cuda-arch 75-real` (RTX 20-series) or `--cuda-arch 86-real` (RTX 30-series). A build targeting only a newer GPU
+can fail with `no kernel image is available for execution on the device`; this is separate from running out
+of VRAM and changing quantization will not fix it.
 
 ## Generate
 
@@ -64,11 +70,20 @@ Key options:
 | `-v` / `--verbose` | Show audio.cpp `[TIMING]`/`[TRACE]` lines. |
 
 Each run writes `<out>.request.json` next to the audio with the effective request, model, package, command, elapsed
-time, peak VRAM, and metric lines.
+time, GPU memory peaks, and metric lines. Memory is sampled every two seconds, so brief peaks can be missed:
+
+- `peak_vram_mib`: dedicated VRAM on the whole selected GPU via `nvidia-smi`, including other applications.
+- `peak_process_gpu_dedicated_mib`, `peak_process_gpu_shared_mib`, `peak_process_gpu_total_mib`: Windows counters
+  for the `audiocpp_cli` process, summed across its GPU adapters. The combined peak is the largest dedicated +
+  shared sum observed in one sample; it is not the sum of the separate peaks. These fields are `null` if the
+  process counters are unavailable. A measured zero stays `0`.
+
+The completion message shows the process peaks when available. Otherwise it labels the whole-GPU dedicated
+peak and reports that process/shared memory is unavailable.
 
 ### Measured on an RTX 3080 10 GB (CUDA 13.4, driver 616.92)
 
-| Run | Audio | Wall time | RTF | Peak GPU memory (whole card) |
+| Run | Audio | Wall time | RTF | Peak dedicated VRAM (whole card) |
 |---|---|---|---|---|
 | yue2 `--cot off --max-semantic-tokens 1500`, q8_0 | 60 s | 20 s | 0.33 | 6.4 GB |
 | yue2 `--cot full`, default tokens, q8_0 | 147 s | 66 s | 0.45 | 8.1 GB |
@@ -85,10 +100,24 @@ Semantic tokens map to audio at 25 tokens per second, so the default cap of 9000
 Start with `q8_0`. If audio.cpp reports a CUDA out-of-memory error, retry with `--quant q4_0` (about 1.1 GB less)
 or a lower `--max-semantic-tokens` (the KV cache and NAR graph grow with song length), and close other GPU-heavy
 programs. Two renders at once on a 10 GB card will run out of memory or crawl. `yueno generate` warns before
-running when free VRAM looks too small for the chosen variant. Pass `-v` to see audio.cpp's per-stage timing lines.
+running when free VRAM looks too small for the chosen variant: generation may fail or run slowly if memory
+spills into shared system RAM. Pass `-v` to see audio.cpp's per-stage timing lines.
 
 The `yue2.*_arena_mb` session options that audio.cpp exposes size host-side graph descriptor pools, not GPU
 buffers, so they are not a VRAM lever and yueno does not expose them.
+
+### Keeping Q8_0 on a 6 GiB GPU
+
+Windows' shared GPU memory is system RAM, separate from the card's dedicated VRAM. NVIDIA's
+[system-memory fallback](https://nvidia.custhelp.com/app/answers/detail/a_id/5490) can let CUDA workloads exceed
+dedicated VRAM, at reduced speed. In NVIDIA Control Panel, under **Manage 3D settings > Program Settings**, add
+`third_party/audio.cpp/build/windows-cuda-release/bin/audiocpp_cli.exe` and leave **CUDA - Sysmem Fallback Policy**
+at **Driver Default** to allow fallback. The process using CUDA is this executable.
+
+Keep `--package q8_0` and try `--cot off --max-semantic-tokens 1500` for an initial 60-second test. This keeps
+the weight precision while reducing the generation workload; the token cap can cut the song short. The VRAM
+warning estimates dedicated-memory needs and does not count shared RAM. Fallback is slower and may still fail
+for some allocations, so shared RAM is not a guarantee that every song length will fit.
 
 ## Controlling song length
 
@@ -109,6 +138,18 @@ properly, make the model plan a shorter song instead:
 
 ## Request file
 
+For a 16-bit floating-point example, use `requests/example-bf16.json`. It selects YuE2's BF16 main weights
+(bfloat16, rather than IEEE FP16); the VAE uses F16 by default:
+
+```powershell
+uv run yueno models pull --model yue2 --package bf16
+uv run yueno generate --request requests/example-bf16.json
+```
+
+BF16 is larger than Q8_0 and can use more shared memory on a 6 GiB card. The sample has short lyrics and a
+1500-token safety cap (up to 60 seconds), which can cut off the ending. The weights are downloaded only when
+you run `models pull`.
+
 ```json
 {
   "id": "my_song",
@@ -121,7 +162,8 @@ properly, make the model plan a shorter song instead:
 }
 ```
 
-`model` is a family name or a list (default `yue2`). Shared optional fields: `seed`, `steps`, `guidance`,
+`model` is a family name or a list (default `yue2`). `package` optionally selects the weight variant; command-line
+`--package` (or `--quant` for yue2) overrides it. Shared optional fields: `seed`, `steps`, `guidance`,
 `duration`. Anything else is passed to the family by its audio.cpp option name (`cot`, `abc_file`,
 `semantic_max_tokens`, `ar_guidance_scale`, ...); keys unknown to every family are rejected as typos. The old
 `cfg_scale` key still works as `guidance`. Command-line flags override the file. Omit `seed` to get a different

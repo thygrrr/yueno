@@ -105,7 +105,7 @@ def doctor() -> None:
 def build(sha: str = typer.Option(AUDIOCPP_PINNED_SHA, help="audio.cpp commit to build"),
           jobs: int = typer.Option(0, help="Parallel build jobs (0 = script default)"),
           clean: bool = typer.Option(False, help="Clean the build directory first"),
-          cuda_arch: str = typer.Option("86-real", help="CMAKE_CUDA_ARCHITECTURES (86 = RTX 30xx, 'auto' = detect)")) -> None:
+          cuda_arch: str = typer.Option("auto", help="CMAKE_CUDA_ARCHITECTURES (auto = detect, 75-real = RTX 20xx, 86-real = RTX 30xx)")) -> None:
     """Clone audio.cpp at the pinned commit and build audiocpp_cli.exe with CUDA."""
     paths = Paths.resolve()
     try:
@@ -288,7 +288,7 @@ def generate(
     if output is not None and multi:
         _fail("--out applies to a single model; with several models outputs are named <id>-<model>-<seed>.wav", 2)
     settings = {"vae": vae}
-    variant_for = {f.name: (package or (quant if f is YUE2 else None)) for f in families}
+    variant_for = {f.name: (package or (quant if f is YUE2 else None) or req.package) for f in families}
     plan: list[tuple[_Weights, Path, list[str]]] = []
     for fam in families:
         w = _resolve_weights(paths, fam, variant_for[fam.name], settings)
@@ -340,14 +340,15 @@ def _run_one(paths: Paths, req: SongRequest, w: _Weights, wav: Path, cmd: list[s
     err.print(f"[bold]yueno[/bold] {req.id} model={fam.name} package={w.variant} seed={req.seed} -> {wav}")
     started = time.monotonic()
     with PeakSampler(index=device or 0) as sampler:
-        code, log_text = audiocpp.run_streaming(cmd, cwd=paths.exe.parent, on_line=_line_printer(verbose))
+        code, log_text = audiocpp.run_streaming(cmd, cwd=paths.exe.parent, on_line=_line_printer(verbose),
+                                              on_start=sampler.start)
     elapsed = time.monotonic() - started
 
     metrics = _parse_metrics(log_text)
     truncated = _was_truncated(log_text, fam.truncation_marker)
     record = {
         "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "request": req.to_dict(),
+        "request": req.with_overrides(package=w.variant).to_dict(),
         "model": fam.name,
         "package": w.variant,
         "settings": w.settings,
@@ -356,6 +357,9 @@ def _run_one(paths: Paths, req: SongRequest, w: _Weights, wav: Path, cmd: list[s
         "exit_code": code,
         "elapsed_s": round(elapsed, 1),
         "peak_vram_mib": sampler.peak_mib or None,
+        "peak_process_gpu_dedicated_mib": sampler.process_dedicated_mib,
+        "peak_process_gpu_shared_mib": sampler.process_shared_mib,
+        "peak_process_gpu_total_mib": sampler.process_total_mib,
         "metrics": metrics,
         "truncated": truncated,
     }
@@ -383,7 +387,12 @@ def _run_one(paths: Paths, req: SongRequest, w: _Weights, wav: Path, cmd: list[s
         except (RuntimeError, subprocess.CalledProcessError) as exc:
             err.print(f"[red]error:[/red] conversion failed: {exc}")
             return False
-    peak = f", peak VRAM {sampler.peak_mib} MiB" if sampler.peak_mib else ""
+    if sampler.process_total_mib is not None:
+        peak = (f", process GPU peaks: dedicated {sampler.process_dedicated_mib:.0f} MiB, "
+                f"shared {sampler.process_shared_mib:.0f} MiB, combined {sampler.process_total_mib:.0f} MiB")
+    else:
+        peak = (f", peak dedicated VRAM (whole GPU) {sampler.peak_mib} MiB; process/shared memory unavailable"
+                if sampler.peak_mib else ", GPU memory unavailable")
     audio_s = metrics.get("audio_duration_ms")
     length = f", {float(audio_s) / 1000:.0f}s audio" if audio_s else ""
     rtf = f", RTF {float(metrics['rtf']):.2f}" if "rtf" in metrics else ""

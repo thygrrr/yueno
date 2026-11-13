@@ -63,14 +63,15 @@ def checkout(paths: Paths, sha: str = AUDIOCPP_PINNED_SHA, *, log: Callable[[str
 
 
 def build(paths: Paths, *, sha: str = AUDIOCPP_PINNED_SHA, jobs: int = 0, clean: bool = False,
-          cuda_arch: str = "86-real", log: Callable[[str], None] = print) -> Path:
+          cuda_arch: str = "auto", log: Callable[[str], None] = print) -> Path:
     cuda = find_cuda_toolkit()
     if cuda is None:
         raise BuildError(
             f"No CUDA toolkit v{MIN_CUDA_MAJOR}.x found under {CUDA_ROOT} or CUDA_PATH. Install CUDA 13.4.1 from "
             "https://developer.nvidia.com/cuda-downloads and rerun 'yueno build'."
         )
-    for tool in ("git", "cmake", "ninja", "powershell"):
+    # The upstream script also finds CMake/Ninja bundled with Visual Studio.
+    for tool in ("git", "powershell"):
         if not shutil.which(tool):
             raise BuildError(f"{tool} is not on PATH")
     checkout(paths, sha, log=log)
@@ -133,13 +134,16 @@ def source_sha(paths: Paths) -> str | None:
     return proc.stdout.strip() or None
 
 
-def run_streaming(cmd: list[str], *, cwd: Path, on_line: Callable[[str], None]) -> tuple[int, str]:
+def run_streaming(cmd: list[str], *, cwd: Path, on_line: Callable[[str], None],
+                  on_start: Callable[[int], None] | None = None) -> tuple[int, str]:
     """Run a command, forwarding merged stdout/stderr line by line; returns (exit code, full text)."""
     proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                             encoding="utf-8", errors="replace", bufsize=1, env=runtime_env())
     lines: list[str] = []
     assert proc.stdout is not None
     try:
+        if on_start:
+            on_start(proc.pid)
         for line in proc.stdout:
             line = line.rstrip("\r\n")
             lines.append(line)

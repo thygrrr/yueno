@@ -28,6 +28,8 @@ def test_valid_default_request():
     (dict(duration=-1), "duration"),
     (dict(seed="7"), "seed"),
     (dict(seed=True), "seed"),
+    (dict(package=""), "package"),
+    (dict(package=16), "package"),
     (dict(extra={"cot": "plan"}), "cot"),
     (dict(extra={"cot": "off", "abc": "X:1"}), "ABC"),
     (dict(extra={"semantic_max_tokens": -1}), "semantic_max_tokens"),

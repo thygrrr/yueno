@@ -9,6 +9,7 @@ import threading
 from dataclasses import dataclass
 
 from .families import Family
+from .windows_gpu import ProcessGpuMemory
 
 HEADROOM_MIB = 512
 
@@ -56,9 +57,8 @@ def vram_warning(free_mib: int, family: Family, variant: str) -> str | None:
     need = family.peak_mib.get(variant)
     if need is None or free_mib >= need + HEADROOM_MIB:
         return None
-    fits = [v for v in family.variants if v != variant and free_mib >= family.peak_mib.get(v, 10**9) + HEADROOM_MIB]
-    hint = f" Consider --package {fits[0]}." if fits else " Shorten the song or free GPU memory."
-    return f"{family.name} {variant} peaks near {need} MiB but only {free_mib} MiB VRAM is free.{hint}"
+    return (f"{family.name} {variant} was measured near {need} MiB, but only {free_mib} MiB dedicated VRAM is free. "
+            "Generation may fail or run slowly if it falls back to shared system memory.")
 
 
 def looks_like_oom(text: str) -> bool:
@@ -67,28 +67,53 @@ def looks_like_oom(text: str) -> bool:
 
 
 class PeakSampler:
-    """Samples nvidia-smi memory.used in a background thread and keeps the maximum."""
+    """Sample whole-GPU VRAM plus Windows process dedicated/shared/combined peaks."""
 
     def __init__(self, interval: float = 2.0, index: int = 0) -> None:
         self.interval = interval
         self.index = index
         self.peak_mib = 0
+        self.process_dedicated_mib: float | None = None
+        self.process_shared_mib: float | None = None
+        self.process_total_mib: float | None = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def _run(self) -> None:
-        while not self._stop.is_set():
-            info = query_gpu(self.index)
-            if info:
-                self.peak_mib = max(self.peak_mib, info.used_mib)
-            self._stop.wait(self.interval)
+        try:
+            memory = ProcessGpuMemory(self._pid)
+        except OSError:
+            memory = None
+        try:
+            while not self._stop.is_set():
+                info = query_gpu(self.index)
+                if info:
+                    self.peak_mib = max(self.peak_mib, info.used_mib)
+                if memory:
+                    try:
+                        sample = memory.sample()
+                    except OSError:
+                        sample = None
+                    if sample is not None:
+                        self._record_process_memory(*sample)
+                self._stop.wait(self.interval)
+        finally:
+            if memory:
+                memory.close()
+
+    def _record_process_memory(self, dedicated: int, shared: int) -> None:
+        self.process_dedicated_mib = max(self.process_dedicated_mib or 0, dedicated / 2**20)
+        self.process_shared_mib = max(self.process_shared_mib or 0, shared / 2**20)
+        self.process_total_mib = max(self.process_total_mib or 0, (dedicated + shared) / 2**20)
+
+    def start(self, pid: int) -> None:
+        self._pid = pid
+        self._thread.start()
 
     def __enter__(self) -> "PeakSampler":
-        if shutil.which("nvidia-smi"):
-            self._thread.start()
         return self
 
     def __exit__(self, *exc: object) -> None:
         self._stop.set()
         if self._thread.is_alive():
-            self._thread.join(timeout=self.interval + 1)
+            self._thread.join()

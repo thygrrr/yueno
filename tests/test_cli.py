@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from yueno.cli import app
@@ -32,6 +33,18 @@ def test_generate_dry_run_from_request(tmp_path):
     assert "cot=off" in cmd and "semantic_max_tokens=1500" in cmd
     assert "late_trains-831001.wav" in cmd
     assert str(tmp_path / "models" / "Yue2-3B-GGUF") in cmd
+
+
+def test_bf16_request_selects_weights_and_cli_can_override(tmp_path):
+    example = EXAMPLE.with_name("example-bf16.json")
+    args = ["generate", "--request", str(example), "--dry-run"]
+    result = runner.invoke(app, args, env=_env(tmp_path))
+    assert result.exit_code == 0, result.output
+    assert "yue2.model_gguf=yue2-3b-bf16.gguf" in result.stdout
+    assert "yue2.vae_gguf=yue2-vae-f16.gguf" in result.stdout
+    override = runner.invoke(app, args + ["--package", "q8_0"], env=_env(tmp_path))
+    assert override.exit_code == 0, override.output
+    assert "yue2.model_gguf=yue2-3b-q8_0.gguf" in override.stdout
 
 
 def test_generate_dry_run_multi_model_from_file(tmp_path):
@@ -107,6 +120,64 @@ def test_models_list_runs(tmp_path):
 def test_version():
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0 and "yueno" in result.stdout
+
+
+def test_build_detects_gpu_by_default(tmp_path, monkeypatch):
+    from yueno import audiocpp
+
+    calls = []
+    monkeypatch.setattr(audiocpp, "build", lambda paths, **kwargs: calls.append(kwargs) or paths.exe)
+    monkeypatch.setattr(audiocpp, "gen_families", lambda exe: {"yue2", "minimax_music3"})
+    result = runner.invoke(app, ["build"], env=_env(tmp_path))
+    assert result.exit_code == 0, result.output
+    assert calls[0]["cuda_arch"] == "auto"
+
+
+@pytest.mark.parametrize("shared", [0.0, None])
+def test_generate_records_process_memory_and_unknown_values(tmp_path, monkeypatch, shared):
+    from yueno import cli
+
+    starts = []
+
+    class Sampler:
+        peak_mib = 200
+        process_dedicated_mib = 100.0 if shared is not None else None
+        process_shared_mib = shared
+        process_total_mib = 100.0 if shared is not None else None
+
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def start(self, pid):
+            starts.append(pid)
+
+    def generate(cmd, *, on_start, **kwargs):
+        on_start(123)
+        Path(cmd[cmd.index("--out") + 1]).write_bytes(b"test audio")
+        return 0, "metrics.audio_duration_ms=1000"
+
+    (tmp_path / "audiocpp_cli.exe").touch()
+    monkeypatch.setattr(cli, "PeakSampler", Sampler)
+    monkeypatch.setattr(cli, "query_gpu", lambda index: None)
+    monkeypatch.setattr(cli.models, "missing_files", lambda *args: [])
+    monkeypatch.setattr(cli.audiocpp, "run_streaming", generate)
+    monkeypatch.setattr(cli.audiocpp, "source_sha", lambda paths: None)
+    result = runner.invoke(app, ["generate", "--style", "jazz", "--lyrics", "[Verse]\nHello", "--seed", "1"],
+                           env=_env(tmp_path))
+    assert result.exit_code == 0, result.output
+    record = json.loads((tmp_path / "outputs" / "song-1.request.json").read_text())
+    assert starts == [123]
+    assert record["peak_vram_mib"] == 200
+    assert record["request"]["package"] == record["package"] == "q8_0"
+    assert record["peak_process_gpu_shared_mib"] == shared
+    assert record["peak_process_gpu_total_mib"] == (100.0 if shared is not None else None)
+    assert ("process GPU peaks" if shared is not None else "memory unavailable") in result.output
 
 
 def test_parse_metrics():

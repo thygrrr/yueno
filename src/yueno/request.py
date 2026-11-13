@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from .specs import ModelSpec
 
 SEED_BITS = 31  # audio.cpp --seed is a signed 32-bit int
-SHARED_FIELDS = ("id", "model", "style", "lyrics", "seed", "steps", "guidance", "duration")
+SHARED_FIELDS = ("id", "model", "style", "lyrics", "seed", "steps", "guidance", "duration", "package")
 LEGACY_KEYS = {"cfg_scale": "guidance"}  # old request keys mapped onto shared fields
 PATH_KEYS = ("abc_file",)  # extras resolved relative to the request file
 
@@ -35,6 +35,7 @@ class SongRequest:
     steps: int | None = None
     guidance: float | None = None
     duration: float | None = None
+    package: str | None = None
     extra: dict[str, object] = field(default_factory=dict)  # family-specific request options, passed by name
 
     @classmethod
@@ -75,6 +76,8 @@ class SongRequest:
             raise RequestError("lyrics must not be empty")
         if not self.models:
             raise RequestError("at least one model is required")
+        if self.package is not None and (not isinstance(self.package, str) or not self.package.strip()):
+            raise RequestError("package must be a non-empty string")
         if self.seed is not None and (not isinstance(self.seed, int) or isinstance(self.seed, bool)):
             raise RequestError("seed must be an integer")
         if self.steps is not None and (isinstance(self.steps, bool) or not isinstance(self.steps, int) or self.steps <= 0):
